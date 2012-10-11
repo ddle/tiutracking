@@ -1,0 +1,797 @@
+<!doctype html>
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+	<head>
+		<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+
+		<title>Asset Tracking System</title>
+		
+		<link rel="shortcut icon" href= "favicon.ico">
+		
+		<script type="application/javascript">
+
+			/** class SceneManager */
+			
+			var _30IN_TO_PIXEL = 119;	// Number of pixels equivalent to 1m
+			var CIRCLE_RADIUS = 25;
+			
+			function SceneManager(aCanvas) {
+				
+				/* Enum TComponentState */
+				var csLoading = 0;
+				var csPostLoading = 1;
+				var csLoaded  = 2;	
+			
+				var self = this;
+				var componentState = csLoading;
+				
+				var mapImage = null;	// DOM image element
+				var mapCenter = new TVector2D();
+				var mapBackgroundColor = '#DDDDFF';
+				
+				var frontCanvas;
+				var frontContext;
+				var frontCanvasCenter = new TVector2D();
+				
+				var backCanvas;
+				var backContext;
+								
+				var objects;				// Array of all objects to be drawn
+				var objectIndex;			// Index of the object currently selected
+				var hoverObjectIndex;		// The object that is currently under the mouse
+
+				var fitScale = 0;			// The scale at which the scene fits perfectly inside the mapCanvas
+				var minScale = 0.1;
+				var maxScale = 2;		
+				
+				var mouse = {
+					position: new TVector2D(),
+					velocity: new TVector2D(),
+					transformedPosition: new TVector2D(),
+					isLeftButtonDown: false
+				};
+
+				var scene = {
+					position: new TVector2D(),
+					targetPosition: new TVector2D(),
+					scale: 1,						// Current scale of the scene
+					targetScale: 1,					// Target scale of the scene
+					totalScale: _30IN_TO_PIXEL		// Scale * _30IN_TO_PIXEL
+				};
+								
+				var FRAME_INTERVAL = 40;
+				var LERP_FACTOR = FRAME_INTERVAL * 0.005; /*some unit / ms^2 */;
+				
+				var timerHandle;		// Timer handle, used for scene animation
+			
+			/* Initialization */
+				if (aCanvas && aCanvas.getContext) {
+					frontContext = aCanvas.getContext('2d');
+					frontContext.fillStyle = mapBackgroundColor;
+					frontContext.font = '20px sans-serif';
+					frontCanvas = aCanvas;
+					
+					frontCanvasCenter.x = frontCanvas.width * 0.5;
+					frontCanvasCenter.y = frontCanvas.height * 0.5;
+					
+					backCanvas = document.createElement('canvas');
+					backCanvas.width = frontCanvas.width;
+					backCanvas.height = frontCanvas.height;
+					backContext = backCanvas.getContext('2d');
+					
+					/* Create an transparent mask right on top of the canvas to capture events.
+					mask = document.createElement('div');
+					frontCanvas.id = 'mask';
+					frontCanvas.style.position = 'absolute';
+					frontCanvas.style.zIndex = 1;
+					// By default, the mask is transparent, but we need to explicity set it or IE will complain :D
+					frontCanvas.style.backgroundColor = 'rgba(255, 255, 255, 0)';
+					document.body.appendChild(mask);
+					*/
+				} else {
+					throw 'Canvas undefined or not supported';
+				}
+			
+			/* public */
+				
+				/**	
+				 *	Event onChanged()
+				 *	This event happens when new object is selected
+				 *	Implement a handler to capture the event
+				 */
+				 this.onChanged = null;
+				
+				/**
+				 * Event onReady()
+				 * Happens when the scene is ready (all objects loaded, entrance animation done)
+				 * Implement a handler to capture the event
+				 */
+				this.onReady = null;
+				
+				/**
+				 *	This function must be called after the map is loaded
+				 */
+				this.show = function () {
+					if (componentState == csLoading) {
+						componentState = csPostLoading;
+
+						mapCenter.x = mapImage.width * 0.5;
+						mapCenter.y = mapImage.height * 0.5;
+
+						scene.scale = 0.001;
+						scene.targetScale = fitScale;
+						scene.totalScale = scene.scale * _30IN_TO_PIXEL;
+
+						scene.position.multSubSet(frontCanvasCenter, mapCenter, scene.scale);
+						scene.targetPosition.multSubSet(frontCanvasCenter, mapCenter, scene.targetScale);
+						
+						startAnimation();
+					}
+				}
+				
+				/**
+				 *	Returns the index of the currently selected object
+				 */
+				this.getObjectIndex = function () {
+					return objectIndex;
+				}
+				
+				/**
+				 *	Sets the map image
+				 *
+				 *	@param	value	{HTMLImageElement}	The image used as the map
+				 */
+				this.setMapImage = function (value) {
+					if (mapImage != value) {
+						mapImage = value;
+						recalculateScales();
+					}
+				}
+				
+				function recalculateScales() {
+					if (mapImage) {
+						var sw = frontCanvas.width  / mapImage.width;
+						var sh = frontCanvas.height / mapImage.height;
+						minScale = fitScale = Math.min(sw, sh) * 0.95;
+					} else {
+						minScale = fitScale = 1;
+					}				
+				}
+				
+				this.setSize = function (w, h) {
+				/*
+					//TODO: Improve or remove
+					
+					var sw = w / frontCanvas.width;
+					var sh = h / frontCanvas.height;
+					var s = sw;
+					if (Math.abs(s - 1) < Math.abs(sh - 1))
+						s = sh;
+					scene.position.x *= sw;
+					scene.position.y *= sh;
+					scene.targetPosition.assign(scene.position);
+					scene.targetScale = scene.scale = scene.scale * s;
+					scene.totalScale  = scene.scale * _30IN_TO_PIXEL;
+				*/
+					frontCanvas.width  = backCanvas.width  = w;
+					frontCanvas.height = backCanvas.height = h;
+					
+					frontCanvas.style.width  = w + SPixel;
+					frontCanvas.style.height = h + SPixel;
+					
+					frontCanvasCenter.x = w * 0.5;
+					frontCanvasCenter.y = h * 0.5;
+					
+					frontCanvas.style.left = frontCanvas.style.left;
+					frontCanvas.style.top  = frontCanvas.style.top;
+					frontCanvas.style.width = frontCanvas.style.width;
+					frontCanvas.style.height = frontCanvas.style.height;
+					
+					recalculateScales();
+				}
+				
+				/**
+				 *	Check if a point is visible. The coordinates of the point is
+				 *	relative to the top left corner of the mapCanvas.
+				 */
+				this.isPointVisible = function (point) {
+					return	isInRange(point.x, 0, frontCanvas.offsetWidth) &&
+							isInRange(point.y, 0, frontCanvas.offsetHeight)
+				}
+
+				/**
+				 *	Sets the active object. If the object is out of range, it will be brought the center.
+				 *
+				 *	@param	{Integer}	value				Index of the desired object. -1 means none
+				 *
+				 */
+				this.setObjectIndex = function (value) {
+					if (objectIndex != value) {
+						objectIndex = value;
+						if (self.onChanged)
+							self.onChanged();
+						
+						if (objectIndex > -1) {
+							var pos = objects[objectIndex].getPosition();
+							if (self.isPointVisible(sceneToCanvas(pos)))
+								self.invalidate();
+							else {
+								// Brings the object to the center.
+								scene.targetPosition.multSubSet(frontCanvasCenter, pos, scene.scale * _30IN_TO_PIXEL);
+								startAnimation();
+							}
+						} else {
+							self.invalidate();
+						}
+					}
+				}
+				
+				this.setHoverObjectIndex = function (value) {
+					if (hoverObjectIndex != value) {
+						hoverObjectIndex = value;
+						self.invalidate();
+					}
+				}
+				
+				/**
+				 *	Attaches a list of objects to be drawn. Every object must support
+				 *	getPosition, draw(context) functions.
+				 *
+				 *	@param	objs	Array	The object list to be drawn
+				 */
+				this.setObjects = function (objs) {
+					objects = objs ? objs : [];
+				}
+								
+				/**
+				 *	Redraws the map
+				 */
+				this.invalidate = function () {
+					if (componentState == csLoading) {
+						frontContext.fillRect(0, 0, frontCanvas.width, frontCanvas.height);
+						frontContext.fillStyle = 'white';
+						frontContext.fillText('Loading...', frontCanvasCenter.x - 50, frontCanvasCenter.y);
+						frontContext.fillStyle = mapBackgroundColor;
+						return;
+					}
+
+					if (timerHandle) {
+						var animationDone = true;
+						if (scene.position.equals(scene.targetPosition, 1) == false) {
+							animationDone = false;
+							scene.position.lerp(scene.position, scene.targetPosition, LERP_FACTOR);
+						}
+						
+						var ds = scene.targetScale - scene.scale;
+						if (isZero(ds, 0.001) == false) {
+							animationDone = false;
+							scene.scale += ds * LERP_FACTOR;
+							scene.totalScale = scene.scale * _30IN_TO_PIXEL;
+						}
+						
+						if (animationDone) {
+							stopAnimation();
+							if (componentState == csPostLoading) {
+								componentState = csLoaded;
+														
+								frontCanvas.onmousedown = canvasMouseDown;
+								frontCanvas.onmousemove = canvasMouseMove;
+								frontCanvas.onmouseup = canvasMouseUp;
+								frontCanvas.onmousewheel = canvasMouseWheel;
+								frontCanvas.ondblclick = canvasDoubleClick;
+								frontCanvas.addEventListener('DOMMouseScroll', canvasMouseWheel, false);	// Firefox shit
+								
+								if (typeof TouchEvent != 'undefined') {
+									frontCanvas.ontouchstart = canvasTouchStart;
+									frontCanvas.ontouchmove = canvasTouchMove;
+									frontCanvas.ontouchend = canvasTouchEnd;
+								}
+								
+								if (self.onReady)
+									self.onReady();
+							}
+						}
+					}
+					
+					// Clear the mapCanvas
+					backContext.setTransform(1, 0, 0, 1, 0, 0);
+					backContext.fillStyle = mapBackgroundColor;
+					backContext.fillRect(0, 0, frontCanvas.width, frontCanvas.height);
+					
+					// Draw the map image
+					backContext.setTransform(1, 0, 0, 1, scene.position.x, scene.position.y);
+					backContext.drawImage(mapImage, 0, 0, mapImage.width * scene.scale, mapImage.height * scene.scale);
+					
+					// Draw the objects
+					var dx = markerIcons.width * 0.5;
+					for (var i = objects.length - 1; i >= 0; i--) {
+						var pos = objects[i].getPosition();
+						pos.mult(scene.totalScale);
+						var xx = pos.x - dx;
+						backContext.drawImage(markerShadow, xx, pos.y - markerShadow.height);
+						backContext.drawImage(markerIcons, 0, 0, markerIcons.width, 35, xx, pos.y - 35, markerIcons.width, 35);
+					}
+					
+					if (objectIndex > -1) {
+						var pos = objects[objectIndex].getPosition();
+						pos.mult(scene.totalScale);
+						backContext.fillStyle = 'rgba(55, 255, 55, 0.4)';
+						backContext.beginPath();
+						backContext.arc(pos.x, pos.y - CIRCLE_RADIUS * 0.5, CIRCLE_RADIUS, 0, Math.PI * 2, true);
+						backContext.fill();
+					}
+					
+					// Show the map to the world
+					frontContext.drawImage(backCanvas, 0, 0);
+				}
+				
+				/**
+				 *	
+				 *
+				 *	@param	{Double}	percent	Zoom percent compared to the current scale.
+				 *								> 1 means zoom in
+				 *								< 1 means zoom out
+				 *								= 0 means zoom fit
+				 *								< 0 means error (ignored fore now)
+				 *	@param	{Event}		event	An object containing layerX and layerY, i.e. mouse's position w.r.t. the screen.
+				 *								null means mapCanvas's center
+				 */
+				this.zoom = function (event, percent) {
+					if (percent < 0)
+						return;
+
+					updateMouseInfo(event, false);
+					if (percent > 0) {
+						scene.targetScale = ensureRange(scene.scale * percent, minScale, maxScale);
+						scene.targetPosition.lerp(mouse.position, scene.position, scene.targetScale / scene.scale);
+					} else {
+						scene.targetScale = fitScale;
+						scene.targetPosition.multSubSet(mouse.position, mapCenter, scene.targetScale);
+					}
+					
+					if ( !(scene.position.equals(scene.targetPosition, 1) && isZero(scene.scale - scene.targetScale, 0.001)) )
+						startAnimation();
+				}
+				
+				function sceneToCanvas(pos) {
+					var result = new TVector2D();
+					result.multAddSet(scene.position, pos, scene.totalScale);
+					return result;
+				}
+				
+			/* private functions */
+				
+				function startAnimation() {
+					if (timerHandle == null)
+						timerHandle = setInterval(self.invalidate, FRAME_INTERVAL);
+				}
+				
+				function stopAnimation() {
+					if (timerHandle) {
+						clearInterval(timerHandle);
+						timerHandle = null;
+					}
+				}
+				
+				function updateMouseInfo(event, updateVelocity) {
+					if (event) {
+						var x  = event.layerX;// - frontCanvas.offsetLeft;
+						var y  = event.layerY;// - frontCanvas.offsetTop;
+						if (updateVelocity) {
+							mouse.velocity.x = x - mouse.position.x;
+							mouse.velocity.y = y - mouse.position.y;
+						}
+						mouse.position.x = x;
+						mouse.position.y = y;
+					} else {
+						mouse.position.assign(frontCanvasCenter);
+					}
+					var s = 1 / scene.totalScale;
+					mouse.transformedPosition.x = (mouse.position.x - scene.position.x) * s;
+					mouse.transformedPosition.y = (mouse.position.y - scene.position.y) * s;
+				}
+				
+				function updateTouchInfo(event, updateVelocity) {
+					if (event) {
+						var x  = event.touches[0].pageX;
+						var y  = event.touches[0].pageY;
+						if (updateVelocity) {
+							mouse.velocity.x = x - mouse.position.x;
+							mouse.velocity.y = y - mouse.position.y;
+						}
+						mouse.position.x = x;
+						mouse.position.y = y;
+					} else {
+						mouse.position.assign(frontCanvasCenter);
+					}
+					var s = 1 / scene.totalScale;
+					mouse.transformedPosition.x = (mouse.position.x - scene.position.x) * s;
+					mouse.transformedPosition.y = (mouse.position.y - scene.position.y) * s;
+				}
+				
+				function getHoveredObjectIndex() {
+					for (var i = objects.length - 1; i >= 0; i--) {
+						var obj = objects[i];
+						var pos = sceneToCanvas(obj.getPosition());
+						pos.y -= CIRCLE_RADIUS * 0.5;
+						if (pos.distanceTo(mouse.position) < CIRCLE_RADIUS)
+							return i;
+					}
+					return -1;
+				}
+			
+				/**
+				 *	Notes:
+				 *	<this> in the following event handlers refers to the mapCanvas
+				 */
+				 
+				function canvasMouseDown(event) {
+					if (event.button == 0) {
+						stopAnimation();
+						mouse.isLeftButtonDown = true;
+						updateMouseInfo(event, true);
+						event.preventDefault();
+					}
+				}
+				
+				function canvasMouseUp(event) {
+					if (event.button == 0) {
+						this.style.cursor = 'default';
+						mouse.isLeftButtonDown = false;
+						updateMouseInfo(event, false);
+						
+						if ( !mouse.velocity.equals(ZeroVector2D, 2) ) {
+							scene.targetPosition.multAddSet(scene.position, mouse.velocity, 6);
+							startAnimation();
+						} else {
+							self.setObjectIndex(getHoveredObjectIndex());
+						}
+					}
+				}
+				
+				function canvasMouseMove(event) {		
+					updateMouseInfo(event, true);
+					
+					if (mouse.isLeftButtonDown) {
+						this.style.cursor = 'url(http://maps.gstatic.com/intl/en_us/mapfiles/closedhand_8_8.cur), move';
+						scene.targetPosition.add(mouse.velocity);
+						scene.position.assign(scene.targetPosition);
+						self.invalidate();
+					} else {
+						self.setHoverObjectIndex(getHoveredObjectIndex());
+					}
+					
+					event.preventDefault();
+				}
+				
+				function canvasMouseWheel(event) {
+					var delta = event.detail ? -event.detail * 0.1 : event.wheelDelta * 0.0025;
+					var percent = 1 + delta;
+					if (delta < 0)
+						percent = 1 / (1 - delta);
+
+					self.zoom(event, percent);
+					event.preventDefault();
+				}
+				
+				function canvasDoubleClick(event) {
+					self.zoom(null, 1.6);
+				}
+				
+				/* Touch event handlers */
+				
+				function canvasTouchStart(event) {
+					stopAnimation();
+					updateTouchInfo(event, true);
+					event.preventDefault();
+				}
+				
+				function canvasTouchEnd(event) {
+					updateTouchInfo(event, false);
+					if ( !mouse.velocity.equals(ZeroVector2D, 2) ) {
+						scene.targetPosition.multAddSet(scene.position, mouse.velocity, 6);
+						startAnimation();
+					} else {
+						self.setObjectIndex(getHoveredObjectIndex());
+					}
+				}
+				
+				function canvasTouchMove(event) {		
+					updateTouchInfo(event, true);
+					scene.targetPosition.add(mouse.velocity);
+					scene.position.assign(scene.targetPosition);
+					self.invalidate();
+					event.preventDefault();
+				}
+			}
+			
+			/** class AssetInfoItem */
+			
+			function AssetInfoItem(timestamp, x, y, battery) {
+				this.timestamp = timestamp;
+				this.location = new TVector2D();
+				this.location.x = x;
+				this.location.y = y;
+				this.battery = battery;
+			}
+			
+			/** class Asset */
+
+			function Asset(id) {
+			/* public properties */
+				
+				this.id = id;
+				
+				// An array of AssetInfoItem. The first element is the latest.
+				this.infoList = [];
+				
+				// An index into the infoList.
+				// This is needed because the user may want to see the information
+				// of an asset at some time in the past while other tags are displayed
+				// with their latest location.
+				this.historyIndex = 0;
+			}
+			
+			Asset.prototype = {
+				getPosition: function () {
+					var result = new TVector2D();
+					result.assign(this.infoList[this.historyIndex].location);
+					return result;
+				},
+				
+				toString: function () {
+					return this.id.toString();
+				},
+				
+				toHtml: function () {
+					return '<table cellspacing="0" cellpadding="0" style="border-collapse: collapse;"><tr><td style="font-weight: bold;">Name</td><td>:</td><td style="color: White;">' + this.id + '</td></tr>' + '<tr><td style="font-weight: bold;">Battery</td><td>:</td><td style="color: White;">' +this.infoList[this.historyIndex].battery + '%</td></tr></table>';
+				}
+			};
+			
+
+			
+			/** Global variables. Some of these are references to DOM elements. */
+			
+			var map;					// Tracking area
+			var mapCanvas;
+			var mapToolbar;
+
+			var floorImage;				// DOM image element that holds the floor image
+			var markerIcons;			// DOM image element that holds the spot marker icons, stolen from Google Maps :D
+			var markerShadow;			// DOM image element that holds the shadow of the spot marker icons
+
+			var headerPanel;
+			var searchBox;
+			
+			var assetListPanel;
+			var assets = [];			// An array that stores the information of all tracked asset tags
+			var selectedAsset;			// The asset that is currently selected
+			var infoPanel;
+
+			var ajax;					// XMLHttpRequest object to communicate with the server
+			var updateTimerHandle;
+
+			/** Global constants */
+			
+			var UPDATE_INTERVAL = 10000;	// The interval that the web app requests new info of the tags, in ms
+			
+			function updateAssetInfo() {
+				ajax.open('GET', 'AssetInfo.php?id=', true);
+				ajax.send();
+				/*
+				for (var i = 0; i < 10; i++) {
+					var asset = new Asset(randomId());
+					asset.infoList.push(new AssetInfoItem('2011-04-09 12:08:00', Math.random() * 12, Math.random() * 7, 100));
+					assets[i] = asset;
+				}
+				
+				assetList.setItems(assets, false);
+				map.invalidate();
+				*/
+			}
+			/*
+			function randomId() {
+				var result = '';
+				var hexDigits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'];
+				for (var i = 0; i < 2; i++) {
+					for (var j = 0; j < 4 + i; j++) {
+						result += hexDigits[Math.floor(Math.random() * 15)];
+					}
+					result += '-';
+				}
+				for (var j = 0; j < 6; j++) {
+					result += hexDigits[Math.floor(Math.random() * 15)];
+				}
+				return result;
+			}
+			*/
+			
+			/* body onresize event handler */
+			onresize = function () {
+				// Resize the map canvas
+				map.setSize(window.innerWidth, window.innerHeight - headerPanel.offsetHeight);
+				map.invalidate();
+				
+				// Adjust the position of the map toolbar
+				var dy = 0;
+				if (infoPanel.style.visibility != SHidden)
+					dy = infoPanel.offsetHeight;
+				mapToolbar.style.left = (window.innerWidth - mapToolbar.offsetWidth - 10) + SPixel;
+				mapToolbar.style.top  = (window.innerHeight - mapToolbar.offsetHeight - dy - 10) + SPixel;
+
+				// Adjust the position of the asset list panel
+				assetListPanel.style.left = searchBox.offsetLeft + SPixel;
+				assetListPanel.style.top = searchBox.offsetTop + searchBox.offsetHeight + SPixel;
+				
+				infoPanel.style.top = (window.innerHeight - infoPanel.offsetHeight) + SPixel;
+			}
+			
+			/* body onload event handler */
+			onload = function () {
+				// Get references of various UI elements, just to support Firefox shit.
+				mapCanvas = $('mapCanvas');
+				headerPanel = $('headerPanel');
+				searchBox = $('searchBox');
+				mapToolbar = $('mapToolbar');
+				infoPanel = $('infoPanel');
+				
+				// If the browser does not support HTML5 Canvas, show a waring message and get done :D
+				if (mapCanvas.getContext == null) {
+					var el = document.createElement('div');			
+					el.innerHTML = '<div style="position: absolute; left: 0px; top: 0px; width: ' + window.innerWidth +
+					'px; height: ' + window.innerHeight + 'px; z-index: 1000; background-color: rgba(0, 0, 0, 0.5); text-align: center; font-size: 20px; color: white; vertical-align: middle;"><div style="height: ' + window.innerHeight * 0.4 + 'px;"></div>This web app requires HTML5 Canvas. Please upgrade your browser.</div>';
+					document.body.appendChild(el);
+					return;
+				}
+								
+				// Adjust the height of the map canvas to fit the window.
+				mapCanvas.style.top = headerPanel.offsetHeight + SPixel;
+
+				// Load images and icons
+				
+				floorImage = new Image();
+				floorImage.src = 'images/FloorPlan.jpg';
+				floorImage.onload = function () {
+					map.setMapImage(this);
+					map.show();
+				}
+				
+				markerIcons = new Image();
+				markerIcons.src = 'images/Markers.png';
+				
+				markerShadow = new Image();
+				markerShadow.src = 'images/MarkerShadow.png';
+				
+				// Initialize the map
+				map = new SceneManager(mapCanvas);
+				map.setObjects(assets);
+				map.onReady = function () {
+					mapToolbar.style.visibility = SVisible;
+				}
+				map.onChanged = function () {
+					var index = this.getObjectIndex();
+					var dy = 0;
+					if (index > -1) {
+						selectedAsset = assets[index];
+						infoPanel.innerHTML = selectedAsset.toHtml();
+						infoPanel.style.top = (window.innerHeight - infoPanel.offsetHeight) + SPixel;
+						infoPanel.style.visibility = SVisible;
+						dy = infoPanel.offsetHeight;
+					} else {
+						selectedAsset = null;
+						infoPanel.style.visibility = SHidden;
+					}
+					mapToolbar.style.top  = (window.innerHeight - mapToolbar.offsetHeight - dy - 10) + SPixel;
+					assetList.setSelectedIndex(index);
+				}
+				
+				// Initialize the asset list
+				assetList = new TCellList();
+				assetList.onChanged = function () {
+					var index = this.getSelectedIndex();
+					var dy = 0;
+					if (index > -1) {
+						selectedAsset = assets[index];
+						infoPanel.innerHTML = selectedAsset.toHtml();
+						infoPanel.style.top = (window.innerHeight - infoPanel.offsetHeight) + SPixel;
+						infoPanel.style.visibility = SVisible;
+						dy = infoPanel.offsetHeight;
+					} else {
+						selectedAsset = null;
+						infoPanel.style.visibility = SHidden;
+					}
+					mapToolbar.style.top  = (window.innerHeight - mapToolbar.offsetHeight - dy - 10) + SPixel;
+					map.setObjectIndex(index);
+				}
+				assetList.autoHide = true;
+				assetList.clearTextBoxOnExit = true;
+				assetList.attachTextBox(searchBox);
+				
+				assetListPanel = assetList.getElement();
+				assetListPanel.className += ' AbsPos ShowOnReady';
+				document.body.appendChild(assetListPanel);
+								
+				// Initialize the AJAX object
+				ajax = new XMLHttpRequest();
+				ajax.onreadystatechange = function () {
+					if (this.readyState == 4 && this.status == 200) {
+						/*
+							Data returned from AssetInfo.php have the following format:
+							[
+								{
+									id: string,
+									iL:
+									[
+										{
+											t: string,
+											x: float,
+											y: float,
+											b: byte
+										},
+										...
+										{
+											t: string,
+											x: float,
+											y: float,
+											b: byte
+										}
+									]
+								},
+								...
+								{}	// Dummy element
+							]
+						*/
+						var tempAssetList = eval(this.responseText);
+						for (var i = tempAssetList.length - 2; i >= 0; i--) {
+							var item = tempAssetList[i].iL[0];
+							if (assets[i] == null) {
+								assets[i] = new Asset();
+								assets[i].id = tempAssetList[i].id;
+								assets[i].infoList[0] = new AssetInfoItem(item.t, item.x, item.y, item.b);
+							} else {
+								var a = assets[i].infoList[0];
+								a.timestamp = item.t;
+								a.location.x = item.x;
+								a.location.y = item.y;
+								a.battery = item.b;
+								/*
+								assets[i].infoList.push(new AssetInfoItem(item.t, item.x, item.y, item.b));
+								assets[i].historyIndex++;
+								*/
+							}
+						}
+						
+						tempAssetList = null;
+						
+						assetList.setItems(assets, false);
+
+						map.invalidate();
+					}
+				}
+
+				this.onresize();
+				updateAssetInfo();
+				updateTimerHandle = setInterval(updateAssetInfo, UPDATE_INTERVAL);
+			}
+		</script>
+		
+		<link href="TIUTrackingMobile.css" rel="stylesheet" type="text/css"/>
+		
+		<script type="application/javascript" src="js/Utils.js"></script>
+		<script type="application/javascript" src="js/Vector2D.js"></script>
+		<script type="application/javascript" src="js/CellList.js"></script>
+	</head>
+
+	<body>
+		<center id="headerPanel" class="Float AbsPos">
+			<input type="textbox" id="searchBox" placeholder="Search for an asset"/>
+		</center>
+		<canvas id="mapCanvas" class="AbsPos"></canvas>
+		<div id="mapToolbar" class="Float ShowOnReady AbsPos">
+			<button id="zoomOutButton" class="LeftPill TextIcon Translucent" onclick="map.zoom(null, 0.625);">-</button>
+			<button id="zoomFitButton" class="Middle TextIcon Translucent" onclick="map.zoom(null, 0);">[]</button>
+			<button id="zoomInButton" class="RightPill TextIcon Translucent" onclick="map.zoom(null, 1.6);">+</button>
+		</div>
+		<center id="infoPanel" class="ShowOnReady AbsPos"></center>
+	</body>
+</html>
